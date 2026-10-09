@@ -8,15 +8,16 @@ NOVEL ADDITIONS (retained):
   4. Partial Cross-Correlation      — Bz / Ey contributions conditioned on each other
   5. Bootstrap Confidence Bands     — block-bootstrap CIs for all lag estimates
 
-Author  : Dr. S.E. OLUKANNI
-Period  : 2014–2016  (cadence set via run_pipeline(target_freq=...): "5min" or "1min")
-Sources : OMNIWeb (NASA),
+Author  : S.E. OLUKANNI
+Period  : 2014–2018  (cadence set via run_pipeline(target_freq=...): "5min" or "1min")
+Sources : OMNIWeb (NASA), Kyoto WDC
 Python  : 3.10+
 Deps    : numpy, pandas, scipy>=1.7, matplotlib, statsmodels, tqdm
 """
 
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import re
@@ -75,7 +76,7 @@ PHASE_COLORS: dict[str, str] = {
 GAP_FILL_MAX_MIN: float = 30.0        # Sec. 2.1: gaps <= 6 rows @5-min filled
 KP_STEP_MIN: float = 180.0            # Sec. 2.1: Kp is 3-hourly, forward-filled
 CCF_MAX_LAG_MIN: float = 360.0        # Sec. 2.3: CCF searched over 0-360 min
-TE_MAX_LAG_MIN: float = 350.0         # Sec. 2.4: TE searched over tau=5-240 min
+TE_MAX_LAG_MIN: float = 240.0         # Sec. 2.4: TE searched over tau=5-240 min
 GC_MAX_LAG_MIN: float = 100.0         # Sec. 2.6: Granger lag orders 5-100 min
 STORM_CCF_MAX_LAG_MIN: float = 180.0  # storm-by-storm CCF robustness scan range
 PARTIAL_CCF_AR_MAX_MIN: float = 30.0  # Sec. 2.7: Bz regressed on Ey, p=6 lags @5-min
@@ -123,6 +124,17 @@ _PHYS_MAX: dict[str, float] = {
     "SYMH": 9000.0,
     "AE":   9000.0,
     "Kp":   100.0,
+    # BUGFIX: these four were missing entirely when the extended parameter
+    # set (Np, Tp, Pdyn, Beta) was added, so OMNI's own fill/missing-data
+    # codes for them (999.9, 9999999., 99.99, 999.99 respectively) passed
+    # straight through as if they were real measurements. Thresholds below
+    # are set comfortably BELOW each documented fill code but ABOVE any
+    # plausible real extreme value, so genuine extreme storms are preserved
+    # while the fill sentinel is reliably caught.
+    "Np":   900.0,      # fill = 999.9;      real Np rarely exceeds ~150 /cc
+    "Tp":   8.0e6,       # fill = 9999999.;   real Tp rarely exceeds ~5e6 K
+    "Pdyn": 95.0,        # fill = 99.99;      real Pdyn rarely exceeds ~80 nPa
+    "Beta": 900.0,       # fill = 999.99;     real beta rarely exceeds ~100
 }
 
 
@@ -165,28 +177,131 @@ def _skip_header_lines(filepath: str) -> int:
     return 0
 
 
-def load_others_file(filepath: str) -> pd.DataFrame:
+def load_others_file(
+    filepath: str,
+    columns: Optional[list[str]] = None,
+) -> pd.DataFrame:
     """
     Load an OMNIWeb solar-wind/geomagnetic file (breg_others) at any cadence
     (e.g. 5-min or 1-min high-resolution OMNI2 format); cadence is handled
     downstream in merge_to_5min(target_freq=...), not here.
 
-    Expected column layout (selected by position):
-        YYYY  DOY  HR  MN  Bx  By  Bz  Vsw  Ey  AE  SYMH
+    `columns` gives the data-column names IN FILE ORDER, after the leading
+    YYYY DOY HR MN columns (which are always assumed present). If omitted,
+    defaults to EXTENDED_OMNI_COLUMNS below.
+
+    IMPORTANT — column order depends on what you requested from OMNIWeb:
+    OMNIWeb's high-resolution request form (https://omniweb.gsfc.nasa.gov/
+    form/omni_min.html) outputs whichever parameters you tick in ITS OWN
+    fixed master order, not the order you clicked them in. For the extended
+    parameter set used in this study (Bx, By, Bz, flow speed, density,
+    temperature, flow pressure, electric field, plasma beta, AE, SYM/H),
+    OMNIWeb's master order is:
+
+        YYYY DOY HR MN Bx By Bz Vsw Np Tp Pdyn Ey Beta AE SYMH
+
+    which is exactly EXTENDED_OMNI_COLUMNS below. If your downloaded file
+    does not match this — e.g. you omitted a field, or OMNIWeb's own order
+    has changed — pass the correct `columns` list explicitly, or check the
+    physical-range warnings this function prints after loading (a swapped
+    Np/Tp/Beta column shows up immediately as an out-of-range warning).
     """
+    columns = columns or EXTENDED_OMNI_COLUMNS
     skip = _skip_header_lines(filepath)
+
+    # Auto-detect legacy (7 data columns, 2014-2016 submission) vs extended
+    # (11 data columns, with Np/Tp/Pdyn/Beta) schema by counting whitespace-
+    # separated fields on the first data row, so old files still load
+    # correctly without the caller having to pass `columns` explicitly.
+    if columns is EXTENDED_OMNI_COLUMNS:
+        with open(filepath) as f:
+            for _ in range(skip):
+                next(f)
+            first_data_line = f.readline()
+        n_fields = len(first_data_line.split())
+        n_data_cols = n_fields - 4  # minus YYYY DOY HR MN
+        if n_data_cols == len(LEGACY_OMNI_COLUMNS):
+            log.info(
+                "load_others_file: detected %d data columns -> using legacy "
+                "schema (%s). Pass columns=EXTENDED_OMNI_COLUMNS explicitly "
+                "if this file actually has the extended parameters.",
+                n_data_cols, LEGACY_OMNI_COLUMNS,
+            )
+            columns = LEGACY_OMNI_COLUMNS
+        elif n_data_cols != len(EXTENDED_OMNI_COLUMNS):
+            raise ValueError(
+                f"load_others_file: file has {n_data_cols} data columns, "
+                f"which matches neither LEGACY_OMNI_COLUMNS "
+                f"({len(LEGACY_OMNI_COLUMNS)}) nor EXTENDED_OMNI_COLUMNS "
+                f"({len(EXTENDED_OMNI_COLUMNS)}). Pass the correct `columns` "
+                f"list explicitly. First data row: {first_data_line.strip()}"
+            )
+
     df = pd.read_csv(
         filepath,
         sep=r"\s+",
         skiprows=skip,
         header=None,
-        names=["year", "doy", "hour", "minute",
-               "Bx", "By", "Bz", "Vsw", "Ey", "AE", "SYMH"],
+        names=["year", "doy", "hour", "minute"] + columns,
     )
     df.index = _parse_omni_time(df, has_minute=True)
     df.index.name = "time"
     df = _clean_fill_values(df)
-    return df[["Bz", "Vsw", "Ey", "AE", "SYMH"]]
+    _validate_physical_ranges(df)
+    keep = [c for c in
+            ["Bz", "Vsw", "Np", "Tp", "Pdyn", "Ey", "Beta", "AE", "SYMH"]
+            if c in df.columns]
+    return df[keep]
+
+
+# Default column schema for the extended (2014-2018) dataset. See the
+# load_others_file docstring above for why this specific order is expected.
+EXTENDED_OMNI_COLUMNS: list[str] = [
+    "Bx", "By", "Bz", "Vsw", "Np", "Tp", "Pdyn", "Ey", "Beta", "AE", "SYMH",
+]
+
+# Legacy schema (2014-2016 submission, no plasma thermodynamic parameters).
+LEGACY_OMNI_COLUMNS: list[str] = ["Bx", "By", "Bz", "Vsw", "Ey", "AE", "SYMH"]
+
+# Physical range checks: (min, max, unit) used to sanity-check that columns
+# haven't been mis-assigned (e.g. Np/Tp/Beta swapped) after loading.
+_PHYSICAL_RANGES: dict[str, tuple[float, float, str]] = {
+    "Bz":   (-300.0, 300.0, "nT"),
+    "Vsw":  (200.0, 3000.0, "km/s"),
+    "Np":   (0.05, 200.0, "cm^-3"),
+    "Tp":   (1.0e2, 6.0e6, "K"),
+    "Pdyn": (0.01, 90.0, "nPa"),
+    "Beta": (0.001, 100.0, "dimensionless"),
+    "Ey":   (-100.0, 100.0, "mV/m"),
+    "AE":   (0.0, 6000.0, "nT"),
+    "SYMH": (-700.0, 200.0, "nT"),
+}
+
+
+def _validate_physical_ranges(df: pd.DataFrame) -> None:
+    """
+    Sanity-check loaded columns against known physical ranges for each
+    variable. This is a safety net against a column-order mismatch (e.g. Np
+    and Tp swapped) that would otherwise silently corrupt every downstream
+    result — swapped columns typically show up as >50% of values falling
+    outside the expected physical range, which this flags loudly.
+    """
+    for col, (lo, hi, unit) in _PHYSICAL_RANGES.items():
+        if col not in df.columns:
+            continue
+        vals = df[col].dropna()
+        if len(vals) == 0:
+            continue
+        frac_outside = float(((vals < lo) | (vals > hi)).mean())
+        if frac_outside > 0.05:
+            log.warning(
+                "COLUMN VALIDATION WARNING: %s has %.1f%% of values outside "
+                "the expected physical range [%.3g, %.3g] %s. This usually "
+                "means the file's column order doesn't match what was "
+                "assumed (check EXTENDED_OMNI_COLUMNS / the `columns` "
+                "argument) — verify before trusting downstream results.",
+                col, frac_outside * 100, lo, hi, unit,
+            )
 
 
 def load_kp_file(filepath: str) -> pd.DataFrame:
@@ -253,7 +368,7 @@ def merge_to_5min(
     )
 
     combined = others_5.reindex(full_idx).join(kp_5min)
-    key_cols = ["Bz", "Ey", "Vsw", "SYMH", "AE"]
+    key_cols = [c for c in ["Bz", "Ey", "Vsw", "Np", "Tp", "Pdyn", "Beta", "SYMH", "AE"] if c in others.columns]
     was_nan_before = combined[key_cols].isna()
     combined[key_cols] = combined[key_cols].interpolate(method="time", limit=gap_limit)
     # A row is "interpolated" if any key column was NaN before the fill and is
@@ -603,6 +718,159 @@ def storm_peak_drivers(df: pd.DataFrame, storms: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 4c.  CIR / ICME STORM-DRIVER CLASSIFICATION  (Reviewer 2: "requires analyzing")
+# ══════════════════════════════════════════════════════════════════════════════
+
+def expected_proton_temperature(vsw_km_s: np.ndarray) -> np.ndarray:
+    """
+    Expected ("normal solar wind expansion") proton temperature Texp(Vsw),
+    from the linear fit of Elliott et al. (2012, JGR, doi:10.1029/2011JA017125):
+
+        Texp [K] = 486.5 * Vsw [km/s] - 1.2476e5
+
+    used following Richardson & Cane (1995, 2010) to identify anomalously
+    cool solar wind intervals (Tp/Texp < 0.5) associated with ICME ejecta.
+    Clipped at a small positive floor since the linear fit is not meant to
+    be extrapolated to very low speeds.
+    """
+    return np.maximum(486.5 * vsw_km_s - 1.2476e5, 1.0e3)
+
+
+def classify_storm_driver_type(
+    df: pd.DataFrame,
+    storms: list[dict],
+    tp_texp_threshold: float = 0.5,
+    beta_threshold: float = 1.0,
+) -> pd.DataFrame:
+    """
+    Classify each storm's likely solar-wind driver as ICME-like (ejecta) or
+    CIR-like (corotating interaction region) using two established, directly
+    computable discriminators averaged over each storm's driving window
+    (pre_start to min_symh):
+
+      - Tp/Texp: the ratio of observed proton temperature to the expected
+        temperature for normal solar-wind expansion at the observed speed
+        (Elliott et al., 2012). Anomalously low Tp/Texp (< 0.5) is a
+        long-established ICME/ejecta signature (Richardson & Cane, 1995,
+        2010): reconnection-heated ejecta expand adiabatically and arrive
+        cooler than ambient wind at the same speed.
+      - Plasma beta: ICME ejecta typically have low beta (strong, ordered
+        internal field dominating thermal pressure); CIRs, being compressed
+        ambient wind, typically show elevated and more variable beta.
+
+    Classification rule (storm-averaged over the driving window):
+        ICME-like : mean(Tp/Texp) < tp_texp_threshold  AND mean(Beta) < beta_threshold
+        CIR-like  : mean(Tp/Texp) >= 1.0               AND mean(Beta) >= beta_threshold
+        ambiguous : neither pattern is clearly satisfied
+
+    IMPORTANT LIMITATION: this is a deliberately simplified, two-criterion
+    proxy, not a full replication of a published multi-criterion ICME/CIR
+    catalogue (which typically also uses magnetic-field rotation smoothness,
+    bidirectional suprathermal electron strahl, composition anomalies, and
+    manual visual verification — none of which are available from the
+    OMNIWeb parameters used in this study). Storms it calls "ambiguous"
+    should be read as "not classifiable from these two criteria alone",
+    not as a third physical category.
+    """
+    rows = []
+    for sid, s in enumerate(storms):
+        win = df.loc[s["pre_start"]: s["min_symh"]]
+        if win.empty or "Tp" not in win.columns or "Vsw" not in win.columns:
+            continue
+        texp = expected_proton_temperature(win["Vsw"].values)
+        tp_texp = win["Tp"].values / texp
+        mean_tp_texp = float(np.nanmean(tp_texp))
+        mean_beta = float(np.nanmean(win["Beta"])) if "Beta" in win.columns else np.nan
+        mean_pdyn = float(np.nanmean(win["Pdyn"])) if "Pdyn" in win.columns else np.nan
+        mean_np   = float(np.nanmean(win["Np"]))   if "Np"   in win.columns else np.nan
+
+        if np.isnan(mean_tp_texp) or np.isnan(mean_beta):
+            driver_type = "insufficient_data"
+        elif mean_tp_texp < tp_texp_threshold and mean_beta < beta_threshold:
+            driver_type = "ICME-like"
+        elif mean_tp_texp >= 1.0 and mean_beta >= beta_threshold:
+            driver_type = "CIR-like"
+        else:
+            driver_type = "ambiguous"
+
+        rows.append({
+            "storm_id": sid,
+            "min_symh": s["min_value"],
+            "mean_tp_texp": mean_tp_texp,
+            "mean_beta": mean_beta,
+            "mean_pdyn": mean_pdyn,
+            "mean_np": mean_np,
+            "driver_type": driver_type,
+        })
+    result = pd.DataFrame(rows)
+    if len(result):
+        counts = result["driver_type"].value_counts().to_dict()
+        log.info(
+            "CIR/ICME storm-driver classification (Tp/Texp<%.1f & beta<%.1f => "
+            "ICME-like; Tp/Texp>=1.0 & beta>=%.1f => CIR-like): %s",
+            tp_texp_threshold, beta_threshold, beta_threshold, counts,
+        )
+    return result
+
+
+def main_phase_ccf_by_driver_type(
+    df: pd.DataFrame,
+    storms: list[dict],
+    driver_type_df: pd.DataFrame,
+    pairs: list[tuple[str, str]],
+    max_lag_steps: int,
+    dt_min: int,
+    n_bootstrap: int = 100,
+) -> pd.DataFrame:
+    """
+    Re-run the main-phase cross-correlation (Section 2.4/3.4 methodology)
+    separately for ICME-like vs CIR-like storms, to test whether the
+    driver-response coupling lag differs by solar-wind driver type — the
+    substantive question behind Reviewer 2's repeated CIR/CME request,
+    rather than just reporting how many storms fall in each category.
+    """
+    storms_by_id = {sid: driver_type_df.set_index("storm_id")["driver_type"].get(sid)
+                     for sid in range(len(storms))}
+    rows = []
+    for driver_type in ("ICME-like", "CIR-like"):
+        subset = [s for sid, s in enumerate(storms)
+                  if storms_by_id.get(sid) == driver_type]
+        if len(subset) < 3:
+            log.warning(
+                "main_phase_ccf_by_driver_type: only %d storms classified as "
+                "%s -- skipping (need >= 3 for a meaningful CCF).",
+                len(subset), driver_type,
+            )
+            continue
+        mask = label_phases(df, subset) == "main"
+        sub_df = df.loc[mask]
+        for drv, rsp in pairs:
+            if len(sub_df) < 100:
+                continue
+            res = cross_correlation_lag(
+                sub_df[drv].values, sub_df[rsp].values,
+                max_lag_steps=max_lag_steps, dt_min=dt_min, n_bootstrap=n_bootstrap,
+            )
+            rows.append({
+                "driver_type": driver_type, "n_storms": len(subset),
+                "driver": drv, "response": rsp,
+                "peak_lag_min": res["peak_lag_min"], "peak_r": res["peak_r"],
+                "ci_low": res["ci_95"][0], "ci_high": res["ci_95"][1],
+                "n_pts": res["n_points"],
+            })
+    result2 = pd.DataFrame(rows)
+    if len(result2):
+        log.info("\n--- CCF BY STORM-DRIVER TYPE (main phase) ---")
+        for _, r in result2.iterrows():
+            log.info(
+                "  %-10s (N=%2d) | %s→%-5s  lag=%4d min  r=%+.3f",
+                r["driver_type"], r["n_storms"], r["driver"], r["response"],
+                r["peak_lag_min"], r["peak_r"],
+            )
+    return result2
+
+
 def superposed_epoch_by_category(
     df: pd.DataFrame,
     categorized_storms: list[dict],
@@ -703,13 +971,41 @@ def cross_correlation_lag(
     if not boot_peaks:
         boot_peaks = [peak_lag_min]
 
+    # ── Confidence interval: basic (reflected) bootstrap, THEN forced to ──────
+    #    contain the point estimate.
+    # The naive percentile CI (2.5th/97.5th percentile of the bootstrap peak
+    # locations directly) can produce an interval that excludes the point
+    # estimate itself whenever r(tau) is broad/flat near its maximum. The
+    # basic/reflected bootstrap (Efron & Tibshirani, 1993) corrects much of
+    # this, but is NOT itself a guarantee: it reflects the bootstrap
+    # percentiles about the point estimate, which contains the point estimate
+    # if and only if the point estimate lies within the [2.5th, 97.5th]
+    # percentile range of its OWN bootstrap distribution -- and when the
+    # full-sample estimate lands on a sharp, narrow local optimum that most
+    # resampled replicates miss (a real, informative sign of a flat or
+    # multimodal r(tau) curve near its maximum), that condition can fail.
+    # We therefore take the union of the reflected interval with the point
+    # estimate itself, which by construction always contains it; `ci_forced`
+    # records whether this union step actually had to extend the interval,
+    # so the caller can flag/report cases where it occurred rather than
+    # silently widening the interval.
+    lo = 2 * peak_lag_min - float(np.percentile(boot_peaks, 97.5))
+    hi = 2 * peak_lag_min - float(np.percentile(boot_peaks, 2.5))
+    lo, hi = min(lo, hi), max(lo, hi)
+    ci_forced = not (lo <= peak_lag_min <= hi)
+    lo = min(lo, peak_lag_min)
+    hi = max(hi, peak_lag_min)
+    valid_lo, valid_hi = float(lags.min()) * dt_min, float(lags.max()) * dt_min
+    lo = max(lo, valid_lo)
+    hi = min(hi, valid_hi)
+
     return {
         "lags_min":     lags * dt_min,
         "ccf":          ccf_vals,
         "peak_lag_min": peak_lag_min,
         "peak_r":       peak_r,
-        "ci_95":        (float(np.percentile(boot_peaks, 2.5)),
-                         float(np.percentile(boot_peaks, 97.5))),
+        "ci_95":        (lo, hi),
+        "ci_forced":    ci_forced,
         "n_points":     n,
     }
 
@@ -751,6 +1047,7 @@ def phase_lag_table(
                     "peak_r":       round(res["peak_r"], 3),
                     "ci_low":       res["ci_95"][0],
                     "ci_high":      res["ci_95"][1],
+                    "ci_forced":    res.get("ci_forced", False),
                     "n_pts":        res["n_points"],
                     "reliable":     abs(res["peak_r"]) >= min_r_threshold,
                 }
@@ -759,7 +1056,7 @@ def phase_lag_table(
     if not rows:
         return pd.DataFrame(
             columns=["phase", "driver", "response", "peak_lag_min",
-                     "peak_r", "ci_low", "ci_high", "n_pts", "reliable"]
+                     "peak_r", "ci_low", "ci_high", "ci_forced", "n_pts", "reliable"]
         )
     return pd.DataFrame(rows)
 
@@ -849,6 +1146,17 @@ def interpolation_sensitivity_check(
             row["peak_r_interpolated"], row["peak_r_raw_only"], row["r_diff"],
         )
     return merged
+
+
+def _disp(col: str) -> str:
+    """
+    Map an internal dataframe column name to its consistent display form for
+    figure titles/labels/captions. Internal code always indexes data by
+    "SYMH" (a valid Python/pandas identifier), but every reader-facing
+    string should read "SYM-H", never "SYMH" — this is the single place
+    that mapping happens, so it can't drift out of sync between figures.
+    """
+    return {"SYMH": "SYM-H"}.get(col, col)
 
 
 def _standardise_columns(arr: np.ndarray) -> np.ndarray:
@@ -1203,6 +1511,64 @@ def _morlet_cwt(x: np.ndarray, scales: np.ndarray, w0: float = 6.0) -> np.ndarra
     return W
 
 
+def _smooth_time_scale(W: np.ndarray, scales: np.ndarray, dj: float) -> np.ndarray:
+    """
+    Smooth a wavelet (cross-)spectrum in both time and scale, following
+    Torrence & Compo (1998, Eq. 14) as implemented by Grinsted et al. (2004).
+    This is REQUIRED before normalising to get coherence: without it, the
+    normalised cross-spectrum is trivially ~1 at every point by construction
+    (point-wise division of a quantity by itself), which is why the previous
+    implementation (a single 5-sample boxcar in time only, no scale
+    smoothing) produced a coherence map saturated at the top of the colour
+    scale almost everywhere.
+
+    Time smoothing: for the Morlet wavelet, convolve each scale's row with a
+    Gaussian of width equal to that scale (in samples), consistent with the
+    wavelet's own decorrelation length.
+    Scale smoothing: convolve down each time-column with a boxcar of width
+    0.6 (in units of log2-scale / dj), the standard Grinsted et al. choice.
+    """
+    n_scales, n_t = W.shape
+
+    # --- time smoothing (scale-dependent Gaussian) ---
+    time_smoothed = np.empty_like(W)
+    for j, s in enumerate(scales):
+        half = max(1, min(int(round(3 * s)), (n_t - 1) // 2))
+        t = np.arange(-half, half + 1)
+        gwin = np.exp(-0.5 * (t / s) ** 2)
+        gwin /= gwin.sum()
+        time_smoothed[j, :] = np.convolve(W[j, :], gwin, mode="same")
+
+    # --- scale smoothing (boxcar of width 0.6 in log2-scale) ---
+    win_len = max(1, int(round(0.6 / dj)))
+    if win_len % 2 == 0:
+        win_len += 1
+    box = np.ones(win_len) / win_len
+    scale_smoothed = np.apply_along_axis(
+        lambda col: np.convolve(col, box, mode="same"), 0, time_smoothed,
+    )
+    return scale_smoothed
+
+
+def _ar1_coefficient(x: np.ndarray) -> float:
+    """Lag-1 autocorrelation, used to build an AR(1) red-noise surrogate."""
+    x = x - np.nanmean(x)
+    denom = np.nansum(x[:-1] ** 2)
+    if denom < 1e-12:
+        return 0.0
+    return float(np.clip(np.nansum(x[:-1] * x[1:]) / denom, -0.99, 0.99))
+
+
+def _ar1_surrogate(n: int, alpha: float, rng: np.random.Generator) -> np.ndarray:
+    """Generate one AR(1) red-noise surrogate series of length n."""
+    z = rng.standard_normal(n)
+    s = np.empty(n)
+    s[0] = z[0]
+    for i in range(1, n):
+        s[i] = alpha * s[i - 1] + np.sqrt(1 - alpha ** 2) * z[i]
+    return s
+
+
 def wavelet_coherence(
     x: np.ndarray,
     y: np.ndarray,
@@ -1210,17 +1576,21 @@ def wavelet_coherence(
     min_period_min: float = 30.0,
     max_period_min: float = 360.0,
     n_scales: int = 40,
-    smooth_len: int = 5,
+    n_surrogates: int = 100,
+    seed: int = 0,
 ) -> dict:
     """
-    Squared wavelet coherence |R(s,t)|² between x and y.
+    Cross-wavelet transform and squared wavelet coherence |R(s,t)|^2 between
+    x and y, following Torrence & Compo (1998) and Grinsted et al. (2004).
 
-    Returns band_coherence (short/medium/long) and mean_phase_deg for
-    physical interpretation of TE lag > CCF lag.
+    Returns both the cross-wavelet power (XWT) and the coherence, each with
+    an AR(1) Monte Carlo significance level, plus band-averaged coherence
+    and mean phase for physical interpretation.
     """
     x = (x - np.nanmean(x)) / (np.nanstd(x) + 1e-9)
     y = (y - np.nanmean(y)) / (np.nanstd(y) + 1e-9)
 
+    dj = np.log2(max_period_min / min_period_min) / max(1, n_scales - 1)
     scales = np.logspace(
         np.log10(min_period_min / dt),
         np.log10(max_period_min / dt),
@@ -1229,18 +1599,32 @@ def wavelet_coherence(
     Wx = _morlet_cwt(x, scales)
     Wy = _morlet_cwt(y, scales)
 
-    kernel = np.ones(smooth_len) / smooth_len
-
-    def _smooth(arr: np.ndarray) -> np.ndarray:
-        return np.apply_along_axis(lambda row: np.convolve(row, kernel, "same"), 1, arr)
-
-    Sxx = _smooth(np.abs(Wx) ** 2)
-    Syy = _smooth(np.abs(Wy) ** 2)
-    Sxy = _smooth(Wx * np.conj(Wy))
+    Sxx = _smooth_time_scale(np.abs(Wx) ** 2, scales, dj)
+    Syy = _smooth_time_scale(np.abs(Wy) ** 2, scales, dj)
+    Sxy = _smooth_time_scale(Wx * np.conj(Wy), scales, dj)
 
     coherence = np.abs(Sxy) ** 2 / (Sxx * Syy + 1e-15)
     phase     = np.angle(Sxy)
+    xwt_power = np.abs(Wx * np.conj(Wy))          # unsmoothed cross-wavelet power
     periods   = scales * dt
+
+    # ── AR(1) Monte Carlo significance (Grinsted et al. 2004) ──────────────────
+    rng = np.random.default_rng(seed)
+    alpha_x, alpha_y = _ar1_coefficient(x), _ar1_coefficient(y)
+    n = len(x)
+    surr_xwt: list[np.ndarray] = []
+    surr_coh: list[np.ndarray] = []
+    for _ in range(n_surrogates):
+        sx = _ar1_surrogate(n, alpha_x, rng)
+        sy = _ar1_surrogate(n, alpha_y, rng)
+        Wsx, Wsy = _morlet_cwt(sx, scales), _morlet_cwt(sy, scales)
+        surr_xwt.append(np.abs(Wsx * np.conj(Wsy)))
+        Ssxx = _smooth_time_scale(np.abs(Wsx) ** 2, scales, dj)
+        Ssyy = _smooth_time_scale(np.abs(Wsy) ** 2, scales, dj)
+        Ssxy = _smooth_time_scale(Wsx * np.conj(Wsy), scales, dj)
+        surr_coh.append(np.abs(Ssxy) ** 2 / (Ssxx * Ssyy + 1e-15))
+    xwt_sig95 = np.percentile(np.stack(surr_xwt), 95, axis=0)
+    coh_sig95 = np.percentile(np.stack(surr_coh), 95, axis=0)
 
     bands = {"short": (30, 60), "medium": (60, 120), "long": (120, 360)}
     band_coherence: dict[str, np.ndarray] = {}
@@ -1258,7 +1642,7 @@ def wavelet_coherence(
     # edge effects become significant beyond a time sqrt(2)*scale from either
     # boundary. Expressed as the *period* (minutes) above which each time step
     # falls inside the COI (i.e. is edge-affected and should be interpreted
-    # cautiously / excluded), referee comment #25.
+    # cautiously / excluded).
     n_t = Wx.shape[1]
     t_idx = np.arange(n_t)
     edge_dist_steps = np.minimum(t_idx, n_t - 1 - t_idx).astype(float)
@@ -1268,6 +1652,9 @@ def wavelet_coherence(
         "time_steps":     np.arange(len(x)),
         "period_min":     periods,
         "coherence":      coherence,
+        "coherence_sig95": coh_sig95,
+        "xwt_power":      xwt_power,
+        "xwt_sig95":      xwt_sig95,
         "phase":          phase,
         "band_coherence": band_coherence,
         "mean_phase_deg": mean_phase_deg,
@@ -1430,12 +1817,12 @@ def plot_storm_variability(
 ) -> plt.Figure:
     from scipy.stats import pearsonr, spearmanr
 
-    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
-    pair_label = f"{source_col} → {target_col}"
+    fig, axes = plt.subplots(2, 2, figsize=(9.0, 7.6))
+    pair_label = f"{_disp(source_col)} → {_disp(target_col)}"
     panel_labels = ["(a)", "(b)", "(c)", "(d)"]
     for ax, lbl in zip(axes.flat, panel_labels):
         ax.text(0.02, 0.96, lbl, transform=ax.transAxes,
-                fontsize=14, fontweight="bold", va="top")
+                fontsize=13, fontweight="bold", va="top")
 
     ax = axes[0, 0]
     if not te_var.empty:
@@ -1542,7 +1929,11 @@ def granger_causality_test(
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        results_raw = grangercausalitytests(data, maxlag=max_lag_steps, verbose=False)
+        try:
+            results_raw = grangercausalitytests(data, maxlag=max_lag_steps, verbose=False)
+        except TypeError:
+            # Newer statsmodels releases removed the `verbose` kwarg entirely.
+            results_raw = grangercausalitytests(data, maxlag=max_lag_steps)
 
     lags, pvals, fstats = [], [], []
     for lag, res_dict in results_raw.items():
@@ -1561,6 +1952,88 @@ def granger_causality_test(
         "significant": lags[pvals < alpha].tolist(),
         "min_p_lag":   int(lags[np.argmin(pvals)]),
         "min_p":       float(pvals.min()),
+    }
+
+
+def conditional_granger_causality_test(
+    target: np.ndarray,
+    conditioning_driver: np.ndarray,
+    test_driver: np.ndarray,
+    lag_order: int,
+    alpha: float = 0.05,
+) -> dict:
+    """
+    Conditional Granger causality: does `test_driver` carry predictive
+    information about `target` beyond what `conditioning_driver` (and the
+    target's own history) already provide?
+
+    Implements exactly the nested-model F-test described in the manuscript
+    Methods: a reduced VAR regressing target on its own lags and lags of the
+    conditioning driver,
+
+        target_t = sum_i a_i*target_(t-i) + sum_i b_i*cond_(t-i) + eps_t,
+
+    against a full model additionally including lags of the test driver,
+
+        target_t = sum_i a'_i*target_(t-i) + sum_i b'_i*cond_(t-i)
+                   + sum_i c_i*test_(t-i) + eps'_t,
+
+    both at the same lag order p = `lag_order`. Significance is assessed by
+    an F-test on the reduction in residual sum of squares (RSS) from adding
+    the test_driver lags, with (df1, df2) = (p, n - k_full) degrees of
+    freedom, where k_full is the number of parameters in the full model
+    (3p + 1, including the intercept).
+    """
+    from scipy.stats import f as f_dist
+
+    mask = np.isfinite(target) & np.isfinite(conditioning_driver) & np.isfinite(test_driver)
+    y, c, x = target[mask], conditioning_driver[mask], test_driver[mask]
+    y = (y - y.mean()) / (y.std() + 1e-9)
+    c = (c - c.mean()) / (c.std() + 1e-9)
+    x = (x - x.mean()) / (x.std() + 1e-9)
+
+    p = lag_order
+    n = len(y) - p
+    if n <= 3 * p + 5:
+        raise ValueError(
+            f"conditional_granger_causality_test: insufficient samples "
+            f"(n={len(y)}) for lag_order={p}."
+        )
+
+    y_dep = y[p:]
+    X_reduced_cols = [np.ones(n)]
+    X_full_cols = [np.ones(n)]
+    for i in range(1, p + 1):
+        X_reduced_cols.append(y[p - i: len(y) - i])
+        X_reduced_cols.append(c[p - i: len(c) - i])
+    for col in X_reduced_cols:
+        X_full_cols.append(col)
+    for i in range(1, p + 1):
+        X_full_cols.append(x[p - i: len(x) - i])
+
+    X_reduced = np.column_stack(X_reduced_cols)
+    X_full = np.column_stack(X_full_cols)
+
+    beta_r, _, _, _ = np.linalg.lstsq(X_reduced, y_dep, rcond=None)
+    beta_f, _, _, _ = np.linalg.lstsq(X_full, y_dep, rcond=None)
+    rss_reduced = float(np.sum((y_dep - X_reduced @ beta_r) ** 2))
+    rss_full = float(np.sum((y_dep - X_full @ beta_f) ** 2))
+
+    k_full = X_full.shape[1]
+    df1 = p
+    df2 = n - k_full
+    if df2 <= 0 or rss_full <= 0:
+        raise ValueError("conditional_granger_causality_test: degenerate fit (check sample size/lag_order).")
+
+    F = ((rss_reduced - rss_full) / df1) / (rss_full / df2)
+    F = max(F, 0.0)
+    p_value = float(f_dist.sf(F, df1, df2))
+
+    return {
+        "F_statistic": F, "df1": df1, "df2": df2, "p_value": p_value,
+        "lag_order": p, "n_effective": n,
+        "significant": p_value < alpha,
+        "rss_reduced": rss_reduced, "rss_full": rss_full,
     }
 
 
@@ -1642,29 +2115,32 @@ def plot_overview(
     sub = df[df.index.year == year]
     ph  = phase_labels[phase_labels.index.year == year]
 
-    fig, axes = plt.subplots(4, 1, figsize=(14, 9), sharex=True)
+    fig, axes = plt.subplots(4, 1, figsize=(7.4, 8.4), sharex=True)
     panel_meta = [
         ("Bz",   "IMF B$_z$ (nT)"),
         ("Ey",   "E$_y$ (mV m$^{-1}$)"),
-        ("SYMH", "SYM-H (nT)"),
+        ("SYM-H", "SYM-H (nT)"),
         ("AE",   "AE (nT)"),
     ]
     for ax, (col, lab) in zip(axes, panel_meta):
-        ax.plot(sub.index, sub[col], lw=0.5, color="0.3")
+        col_key = "SYMH" if col == "SYM-H" else col
+        ax.plot(sub.index, sub[col_key], lw=0.5, color="0.3")
         for phase, color in PHASE_COLORS.items():
             ax.fill_between(
                 sub.index, *ax.get_ylim(),
                 where=ph.reindex(sub.index, fill_value="quiet") == phase,
                 alpha=0.12, color=color,
-                label=phase if col == "Bz" else "",
+                label=phase if col_key == "Bz" else "",
             )
-        ax.set_ylabel(lab, fontsize=12)
+        ax.set_ylabel(lab, fontsize=11)
+        ax.tick_params(axis="both", labelsize=10)
         ax.axhline(0, lw=0.5, color="k", ls="--")
 
-    axes[0].legend(loc="upper right", fontsize=12, ncol=3)
+    axes[0].legend(loc="upper right", fontsize=9, ncol=3)
     axes[2].axhline(-50, lw=1, color="red", ls=":", label="SYM-H = −50 nT")
-    axes[-1].set_xlabel("Date", fontsize=12)
-    fig.suptitle(f"Solar Wind & Geomagnetic Activity — {year}", fontsize=14)
+    axes[-1].set_xlabel("Date", fontsize=11)
+    fig.suptitle(f"Solar Wind and Geomagnetic Activity, {year} (1-minute cadence)",
+                 fontsize=13)
     fig.tight_layout()
     return fig
 
@@ -1672,7 +2148,7 @@ def plot_overview(
 def plot_sea(sea: dict, variables: list[str]) -> plt.Figure:
     t = sea["epoch_time_hr"]
     fig, axes = plt.subplots(len(variables), 1,
-                             figsize=(10, 3 * len(variables)), sharex=True)
+                             figsize=(7.4, 2.2 * len(variables)), sharex=True)
     if len(variables) == 1:
         axes = [axes]
 
@@ -1681,11 +2157,12 @@ def plot_sea(sea: dict, variables: list[str]) -> plt.Figure:
         ax.plot(t, m, lw=1.8, color="#1565C0", label=f"Mean (N = {n})")
         ax.fill_between(t, m - s, m + s, alpha=0.2, color="#1565C0", label="±1σ")
         ax.axvline(0, color="red", lw=1.2, ls="--", label="SYM-H min")
-        ax.set_ylabel(v)
-        ax.legend(fontsize=8)
+        ax.set_ylabel(v, fontsize=11)
+        ax.tick_params(axis="both", labelsize=10)
+        ax.legend(fontsize=9)
 
-    axes[-1].set_xlabel("Epoch time relative to SYM-H minimum (hours)")
-    fig.suptitle("Superposed Epoch Analysis", fontsize=12)
+    axes[-1].set_xlabel("Epoch time relative to SYM-H minimum (hours)", fontsize=11)
+    fig.suptitle("Superposed Epoch Analysis", fontsize=13)
     fig.tight_layout()
     return fig
 
@@ -1712,9 +2189,14 @@ def plot_sea_by_category(
         ax.plot(t, m, lw=2.2, color=c, label=f"{cat} (N={n})")
         ax.fill_between(t, m - s, m + s, alpha=0.15, color=c)
     ax.axvline(0, color="black", lw=1.2, ls="--", label="SYM-H min")
+    units = {"Bz": "nT", "Vsw": "km s$^{-1}$", "Ey": "mV m$^{-1}$",
+             "SYMH": "nT", "AE": "nT"}
+    unit = units.get(variable, "")
+    ylabel = f"{_disp(variable)} ({unit})" if unit else _disp(variable)
     ax.set_xlabel("Epoch time relative to SYM-H minimum (hours)", fontsize=12)
-    ax.set_ylabel(variable, fontsize=12)
-    ax.set_title(f"Superposed Epoch by Storm Magnitude Category: {variable}", fontsize=13)
+    ax.set_ylabel(ylabel, fontsize=12)
+    ax.set_title(f"Superposed-Epoch Composite by Storm Magnitude Category: "
+                 f"{_disp(variable)}", fontsize=13)
     ax.tick_params(axis="both", labelsize=11)
     ax.legend(fontsize=10)
     fig.tight_layout()
@@ -1746,42 +2228,16 @@ def plot_ccf_curve(ccf_result: dict, title: str = "") -> plt.Figure:
     return fig
 
 
-
-    pairs   = lag_df[["driver", "response"]].drop_duplicates()
-    n_pairs = len(pairs)
-    fig, axes = plt.subplots(1, n_pairs, figsize=(5 * n_pairs, 5), sharey=False)
-    if n_pairs == 1:
-        axes = [axes]
-
-    for ax, (_, row) in zip(axes, pairs.iterrows()):
-        sub    = lag_df[(lag_df["driver"] == row["driver"]) & (lag_df["response"] == row["response"])]
-        colors = [PHASE_COLORS.get(p, "grey") for p in sub["phase"]]
-        ax.barh(sub["phase"], sub["peak_lag_min"], color=colors, edgecolor="white")
-        err_low  = np.clip(sub["peak_lag_min"] - sub["ci_low"],  0, None)
-        err_high = np.clip(sub["ci_high"] - sub["peak_lag_min"], 0, None)
-        ax.barh(sub["phase"], sub["peak_lag_min"],
-                xerr=[err_low.values, err_high.values],
-                color=colors, edgecolor="white", capsize=4, alpha=0.0)
-        for _, r in sub.iterrows():
-            ax.text(r["peak_lag_min"] + 1, sub["phase"].tolist().index(r["phase"]),
-                    f'{r["peak_lag_min"]:.0f} min', va="center", fontsize=9)
-        ax.set_title(f"{row['driver']} → {row['response']}", fontsize=11)
-        ax.set_xlabel("Peak lag (minutes)")
-        ax.axvline(0, color="k", lw=0.8, ls="--")
-
-    fig.suptitle("Phase-Dependent Peak Lag Times (95% CI)", fontsize=13)
-    fig.tight_layout()
-    return fig
-
-
 def plot_lag_results(lag_df: pd.DataFrame) -> plt.Figure:
     pairs   = lag_df[["driver", "response"]].drop_duplicates()
     n_pairs = len(pairs)
-    fig, axes = plt.subplots(1, n_pairs, figsize=(5.5 * n_pairs, 5.5), sharey=False)
-    if n_pairs == 1:
-        axes = [axes]
+    n_cols  = min(2, n_pairs)
+    n_rows  = int(np.ceil(n_pairs / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.0 * n_cols, 3.6 * n_rows),
+                              sharey=False, squeeze=False)
+    axes_flat = axes.flat
 
-    for ax, (_, row) in zip(axes, pairs.iterrows()):
+    for ax, (_, row) in zip(axes_flat, pairs.iterrows()):
         sub    = lag_df[(lag_df["driver"] == row["driver"]) & (lag_df["response"] == row["response"])]
         colors = [PHASE_COLORS.get(p, "grey") for p in sub["phase"]]
         ax.barh(sub["phase"], sub["peak_lag_min"], color=colors, edgecolor="white")
@@ -1790,15 +2246,28 @@ def plot_lag_results(lag_df: pd.DataFrame) -> plt.Figure:
         ax.barh(sub["phase"], sub["peak_lag_min"],
                 xerr=[err_low.values, err_high.values],
                 color=colors, edgecolor="white", capsize=4, alpha=0.0)
+        # Label placement: put the value PAST the end of the CI whisker (not
+        # at the bar tip), with a white background box, so it never overlaps
+        # the whisker line itself -- the overlap in the previous version is
+        # what made the numbers look "clamped together with the line".
+        x_max_needed = 0.0
         for _, r in sub.iterrows():
-            ax.text(r["peak_lag_min"] + 1, sub["phase"].tolist().index(r["phase"]),
-                    f'{r["peak_lag_min"]:.0f} min', va="center", fontsize=13, fontweight="bold")
-        ax.set_title(f"{row['driver']} → {row['response']}", fontsize=14)
-        ax.set_xlabel("Peak lag (minutes)", fontsize=13)
-        ax.tick_params(axis="both", labelsize=10)
+            label_x = max(r["peak_lag_min"], r["ci_high"]) + 2
+            x_max_needed = max(x_max_needed, label_x)
+            ax.text(label_x, sub["phase"].tolist().index(r["phase"]),
+                    f'{r["peak_lag_min"]:.0f} min', va="center", fontsize=10,
+                    fontweight="bold",
+                    bbox=dict(facecolor="white", edgecolor="none", alpha=0.85, pad=1.0))
+        ax.set_xlim(right=x_max_needed * 1.18 + 5)
+        ax.set_title(f"{_disp(row['driver'])} → {_disp(row['response'])}", fontsize=12)
+        ax.set_xlabel("Peak lag (minutes)", fontsize=10)
+        ax.tick_params(axis="both", labelsize=9)
         ax.axvline(0, color="k", lw=0.8, ls="--")
 
-    fig.suptitle("Phase-Dependent Peak Lag Times (95% CI)", fontsize=15)
+    for ax in list(axes_flat)[n_pairs:]:
+        ax.set_visible(False)
+
+    fig.suptitle("Phase-Dependent Peak Lag Times (95% CI)", fontsize=13)
     fig.tight_layout()
     return fig
 
@@ -1817,7 +2286,7 @@ def plot_te_scan(te_result: dict, title: str = "") -> plt.Figure:
     n_surr   = te_result.get("n_surrogates", 100)
     peak_p   = te_result["peak_p"]
 
-    fig, ax = plt.subplots(figsize=(9, 4))
+    fig, ax = plt.subplots(figsize=(7.0, 4.2))
     ax.fill_between(lags_min, 0, surr_95,
                     alpha=0.25, color="grey", label="Surrogate 95th percentile")
     ax.plot(lags_min, te_obs, color="#7B1FA2", lw=1.8, label="Observed TE")
@@ -1832,10 +2301,11 @@ def plot_te_scan(te_result: dict, title: str = "") -> plt.Figure:
         peak_min, color="#E53935", lw=1.4, ls="--",
         label=f"Peak TE at τ = {peak_min} min  (p {p_display})",
     )
-    ax.set_xlabel("Lag τ (minutes)")
-    ax.set_ylabel("Transfer Entropy (bits)")
-    ax.set_title(title or "Transfer Entropy")
-    ax.legend()
+    ax.set_xlabel("Lag τ (minutes)", fontsize=11)
+    ax.set_ylabel("Transfer Entropy (bits)", fontsize=11)
+    ax.set_title(title or "Transfer Entropy", fontsize=13)
+    ax.tick_params(axis="both", labelsize=10)
+    ax.legend(fontsize=9)
 
     if not te_result.get("reliable", True):
         ax.text(
@@ -1872,31 +2342,34 @@ def plot_wavelet_band_coherence(
     n = min(min(len(v) for v in bands.values()), len(time_index))
     t = time_index[:n]
 
-    fig, axes = plt.subplots(3, 1, figsize=(13, 7), sharex=True)
+    fig, axes = plt.subplots(3, 1, figsize=(7.4, 6.3), sharex=True)
     for ax, (band_name, color) in zip(axes, band_colors.items()):
         ax.plot(t, bands[band_name][:n], lw=1.4, color=color, label=band_labels[band_name])
         ax.axhline(0.5, color="k", lw=0.8, ls="--", label="Coherence = 0.5")
         ax.set_ylim(0, 1)
-        ax.set_ylabel("|R²|")
-        ax.legend(fontsize=8, loc="upper right")
+        ax.set_ylabel("|R²|", fontsize=11)
+        ax.tick_params(axis="both", labelsize=10)
+        ax.legend(fontsize=9, loc="upper right")
 
-    axes[-1].set_xlabel("Date")
-    fig.suptitle(title or "Band-averaged Wavelet Coherence (Bz ↔ SYM-H)", fontsize=11)
+    axes[-1].set_xlabel("Date", fontsize=11)
+    fig.suptitle(title or "Band-Averaged Wavelet Coherence (Bz ↔ SYM-H)", fontsize=13)
     fig.tight_layout()
     return fig
 
 
 def plot_granger(gc_result: dict, title: str = "", dt_min: int = 5) -> plt.Figure:
     lags_min = gc_result["lags"] * dt_min
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 5), sharex=True)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(6.5, 5.5), sharex=True)
     ax1.plot(lags_min, gc_result["F_stats"], color="#0277BD", lw=1.8)
-    ax1.set_ylabel("F-statistic")
-    ax1.set_title(title or "Granger Causality")
+    ax1.set_ylabel("F-statistic", fontsize=11)
+    ax1.set_title(title or "Granger Causality", fontsize=13)
+    ax1.tick_params(axis="both", labelsize=10)
     ax2.semilogy(lags_min, gc_result["p_values"], color="#2E7D32", lw=1.8)
     ax2.axhline(0.05, color="red", ls="--", lw=1, label="α = 0.05")
-    ax2.set_ylabel("p-value (log scale)")
-    ax2.set_xlabel("Lag order (minutes)")
-    ax2.legend()
+    ax2.set_ylabel("p-value (log scale)", fontsize=11)
+    ax2.set_xlabel("Lag order (minutes)", fontsize=11)
+    ax2.tick_params(axis="both", labelsize=10)
+    ax2.legend(fontsize=9)
     fig.tight_layout()
     return fig
 
@@ -1906,38 +2379,87 @@ def plot_wavelet_coherence(
     time_index: pd.DatetimeIndex,
     title: str = "",
 ) -> plt.Figure:
-    coh = wc["coherence"]
+    """
+    Two-panel figure following Grinsted et al. (2004): (a) cross-wavelet
+    power (XWT), (b) squared wavelet coherence. Both panels show the AR(1)
+    Monte Carlo 95% significance contour (thick black line), phase arrows
+    (relative phase between the two series; pointing right = in phase,
+    left = anti-phase, up/down = 90 degree lead/lag), and the cone of
+    influence (hatched).
+
+    PRINT SIZING: figsize is set to match a standard double-column journal
+    figure width (~7.4 in = 188 mm) so that the fontsize values below (11 pt
+    labels, 10 pt ticks) render at their stated point size when the figure
+    is inserted at its native width, rather than being shrunk to near-
+    illegible size by the typesetting process.
+    """
     per = wc["period_min"] / 60.0
-    n   = min(coh.shape[1], len(time_index))
+    n   = min(wc["coherence"].shape[1], len(time_index))
+    coi_hr = wc.get("coi_period_min")
+    coi_hr = coi_hr[:n] / 60.0 if coi_hr is not None else None
 
-    fig, ax = plt.subplots(figsize=(14, 5.5))
-    im = ax.pcolormesh(
-        time_index[:n], per, coh[:, :n],
-        cmap="plasma", vmin=0, vmax=1, shading="auto",
-    )
-    ax.set_yscale("log")
-    ax.set_ylabel("Period (hours)", fontsize=12)
-    ax.set_xlabel("Date", fontsize=12)
-    ax.set_title(title or "Wavelet Coherence", fontsize=13)
-    ax.tick_params(axis="both", labelsize=10)
-    cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label("|R²| Coherence", fontsize=11)
-    cbar.ax.tick_params(labelsize=10)
-    ax.axhline(1.0, color="white", lw=1.0, ls="--", label="1 h")
-    ax.axhline(3.0, color="cyan",  lw=1.0, ls="--", label="3 h")
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7.4, 7.8), sharex=True)
+    panel_specs = [
+        (ax1, "(a)", wc["xwt_power"][:, :n], wc["xwt_sig95"][:, :n],
+         "Cross-Wavelet Power", "plasma", None),
+        (ax2, "(b)", wc["coherence"][:, :n], wc["coherence_sig95"][:, :n],
+         "Squared Wavelet Coherence |R\u00b2|", "viridis", (0, 1)),
+    ]
 
-    coi_min = wc.get("coi_period_min")
-    if coi_min is not None:
-        coi_hr = coi_min[:n] / 60.0
-        ax.plot(time_index[:n], coi_hr, color="white", lw=1.6, ls="-",
-                 label="Cone of influence")
-        ax.fill_between(
-            time_index[:n], coi_hr, per.max(),
-            where=coi_hr < per.max(),
-            color="white", alpha=0.25, hatch="//", zorder=2,
-        )
+    # Sparse grid for phase arrows so the plot isn't cluttered.
+    t_step = max(1, n // 30)
+    p_step = max(1, len(per) // 12)
 
-    ax.legend(fontsize=10, loc="upper right")
+    for ax, label, field, sig95, subtitle, cmap, vlim in panel_specs:
+        kwargs = dict(cmap=cmap, shading="auto")
+        if vlim is not None:
+            kwargs.update(vmin=vlim[0], vmax=vlim[1])
+        im = ax.pcolormesh(time_index[:n], per, field, **kwargs)
+        ax.set_yscale("log")
+        ax.set_ylim(per.min(), per.max())
+        ax.set_ylabel("Period (hours)", fontsize=11)
+        ax.set_title(f"{label} {subtitle}", fontsize=12, loc="left")
+        ax.tick_params(axis="both", labelsize=10)
+        cbar = fig.colorbar(im, ax=ax)
+        cbar.ax.tick_params(labelsize=9)
+
+        # AR(1) 95% significance contour.
+        try:
+            ax.contour(
+                time_index[:n], per, field / (sig95 + 1e-15),
+                levels=[1.0], colors="black", linewidths=1.2,
+            )
+        except Exception:
+            pass
+
+        # Phase arrows (Grinsted et al. convention): right = in phase,
+        # left = anti-phase, down = X leads Y by 90 deg, up = Y leads X by
+        # 90 deg. Drawn with a fixed length in point-space (not data-space)
+        # so the arrow angle is not distorted by the log-scaled y-axis.
+        phase = wc["phase"][:, :n]
+        arrow_len_pts = 9
+        for pi in range(0, len(per), p_step):
+            for ti in range(0, n, t_step):
+                ang = phase[pi, ti]
+                dx, dy = arrow_len_pts * np.cos(ang), arrow_len_pts * np.sin(ang)
+                ax.annotate(
+                    "", xy=(time_index[ti], per[pi]), xycoords="data",
+                    xytext=(-dx, -dy), textcoords="offset points",
+                    arrowprops=dict(arrowstyle="->", color="black",
+                                     lw=0.7, alpha=0.6, shrinkA=0, shrinkB=0),
+                )
+
+        if coi_hr is not None:
+            ax.plot(time_index[:n], coi_hr, color="white", lw=1.4, ls="-")
+            ax.fill_between(
+                time_index[:n], coi_hr, per.max(),
+                where=coi_hr < per.max(),
+                color="white", alpha=0.3, hatch="//", zorder=2,
+            )
+
+    ax2.set_xlabel("Date", fontsize=11)
+    fig.suptitle(title or "Cross-Wavelet Transform and Coherence (Bz \u2194 SYM-H)",
+                 fontsize=13)
     fig.tight_layout()
     return fig
 
@@ -1951,17 +2473,18 @@ def plot_decoupling_summary(lag_df: pd.DataFrame) -> dict[str, plt.Figure]:
         ph   = sub[sub["response"] == "SYMH"]["phase"].values
         cols = [PHASE_COLORS.get(p, "grey") for p in ph]
 
-        fig, ax = plt.subplots(figsize=(7, 4))
+        fig, ax = plt.subplots(figsize=(5.5, 4.5))
         ax.scatter(x, y, c=cols, s=120, zorder=3)
         for xi, yi, p in zip(x, y, ph):
-            ax.annotate(p, (xi, yi), textcoords="offset points", xytext=(5, 5), fontsize=9)
+            ax.annotate(p, (xi, yi), textcoords="offset points", xytext=(5, 5), fontsize=10)
         if len(x) and len(y):
             lim = [min(x.min(), y.min()) - 10, max(x.max(), y.max()) + 10]
             ax.plot(lim, lim, "k--", lw=0.8, label="AE = SYM-H (no decoupling)")
-        ax.set_xlabel("SYM-H lag (min)")
-        ax.set_ylabel("AE lag (min)")
-        ax.set_title(f"Lag Asymmetry: {drv} → (SYM-H vs AE)")
-        ax.legend(fontsize=8)
+        ax.set_xlabel("SYM-H lag (min)", fontsize=11)
+        ax.set_ylabel("AE lag (min)", fontsize=11)
+        ax.set_title(f"Lag Asymmetry: {_disp(drv)} → (SYM-H vs AE)", fontsize=12)
+        ax.tick_params(axis="both", labelsize=10)
+        ax.legend(fontsize=9)
         fig.tight_layout()
         figs[drv] = fig
 
@@ -2108,6 +2631,37 @@ def run_pipeline(
         fig_cat.savefig(os.path.join(out, f"sea_by_category_{var}.png"), dpi=300)
         plt.close(fig_cat)
 
+    # ── CIR / ICME storm-driver classification (Reviewer 2) ────────────────────
+    driver_type_df = pd.DataFrame()
+    ccf_by_driver = pd.DataFrame()
+    if {"Tp", "Beta"}.issubset(df.columns):
+        log.info("Classifying storms by solar-wind driver type (ICME-like vs CIR-like) …")
+        driver_type_df = classify_storm_driver_type(df, storms)
+        driver_type_df.to_csv(os.path.join(out, "storm_driver_type.csv"), index=False)
+
+        cross_tab = pd.DataFrame({
+            sid: {"category": s.get("category"),
+                  "driver_type": driver_type_df.set_index("storm_id")["driver_type"].get(sid, "n/a")}
+            for sid, s in enumerate(storms_categorized)
+        }).T
+        cross_tab.to_csv(os.path.join(out, "storm_magnitude_vs_driver_type.csv"))
+        log.info(
+            "Magnitude category x driver type cross-tab:\n%s",
+            pd.crosstab(cross_tab["category"], cross_tab["driver_type"]),
+        )
+
+        ccf_by_driver = main_phase_ccf_by_driver_type(
+            df, storms, driver_type_df, pairs=[("Bz", "SYMH"), ("Ey", "AE")],
+            max_lag_steps=ccf_max_lag_steps, dt_min=dt_min,
+        )
+        ccf_by_driver.to_csv(os.path.join(out, "ccf_by_driver_type.csv"), index=False)
+    else:
+        log.warning(
+            "CIR/ICME classification skipped: Tp and/or Beta columns not present "
+            "in the loaded data (only available with the extended OMNI parameter "
+            "set — see load_others_file / EXTENDED_OMNI_COLUMNS)."
+        )
+
     # ── SEA ───────────────────────────────────────────────────────────────────
     log.info("Superposed epoch analysis …")
     sea = superposed_epoch_analysis(df, storms, variables=["Bz", "Ey", "SYMH", "AE"],
@@ -2121,11 +2675,24 @@ def run_pipeline(
                              min_r_threshold=0.10, min_segment_hrs=10.0)
 
     log.info("\n--- CCF SUMMARY (reliable rows only) ---")
+    n_forced = 0
     for _, row in lag_df[lag_df["reliable"]].iterrows():
+        forced_marker = " [CI extended to include point estimate]" if row.get("ci_forced") else ""
+        if row.get("ci_forced"):
+            n_forced += 1
         log.info(
-            "  %-10s | %s→%-5s  lag=%4d min  r=%+.3f  CI=[%.0f, %.0f]",
+            "  %-10s | %s→%-5s  lag=%4d min  r=%+.3f  CI=[%.0f, %.0f]%s",
             row["phase"], row["driver"], row["response"],
             row["peak_lag_min"], row["peak_r"], row["ci_low"], row["ci_high"],
+            forced_marker,
+        )
+    if n_forced:
+        log.info(
+            "  NOTE: %d of %d rows required extending the reflected-bootstrap "
+            "CI to include the point estimate -- this is a signal that r(tau) "
+            "is flat or multimodal near its maximum for those pairs/phases, "
+            "not a computation error. See phase_lag_table's 'ci_forced' column.",
+            n_forced, lag_df["reliable"].sum(),
         )
 
     # ── Interpolation sensitivity check (referee Major #1) ─────────────────────
@@ -2149,7 +2716,7 @@ def run_pipeline(
             max_lag_steps=ccf_max_lag_steps, dt_min=dt_min, n_bootstrap=100,
         )
         fig_ccf = plot_ccf_curve(
-            ccf_curve, title=f"{phase_name.capitalize()} phase: {drv} → {rsp}",
+            ccf_curve, title=f"{phase_name.capitalize()} phase: {_disp(drv)} → {_disp(rsp)}",
         )
         fig_ccf.savefig(
             os.path.join(out, f"ccf_curve_{phase_name}_{drv}_{rsp}.png"), dpi=300,
@@ -2185,6 +2752,28 @@ def run_pipeline(
             drv, rsp, te_res["peak_te"], te_res["peak_lag_min"], p_str, sig,
         )
 
+    # ── Checkpoint: save TE results immediately ─────────────────────────────────
+    # TE is by far the most expensive step (hours, at large n_max). Save it to
+    # disk right away so a crash in any later, cheaper step (Granger, wavelet,
+    # etc.) never loses this result again.
+    te_summary_rows = []
+    for (drv, rsp), te_res in te_results.items():
+        pd.DataFrame({
+            "lag_min": te_res["lags_min"], "te_bits": te_res["te"],
+            "te_surr_95": te_res["te_surr_95"],
+            "significant": te_res["significant_mask"],
+        }).to_csv(os.path.join(out, f"te_curve_{drv}_{rsp}.csv"), index=False)
+        te_summary_rows.append({
+            "driver": drv, "response": rsp,
+            "peak_lag_min": te_res["peak_lag_min"], "peak_te_bits": te_res["peak_te"],
+            "peak_p": te_res["peak_p"], "n_max": te_n_max,
+        })
+    pd.DataFrame(te_summary_rows).to_csv(
+        os.path.join(out, "te_summary.csv"), index=False,
+    )
+    log.info("Checkpoint: TE results saved to disk (te_curve_*.csv, te_summary.csv).")
+    gc.collect()  # free the large kNN/surrogate working arrays before Granger
+
     # ── TE vs CCF interpretation ───────────────────────────────────────────────
     te_lag  = te_results[("Bz", "SYMH")]["peak_lag_min"]
     ccf_row = lag_df[
@@ -2215,11 +2804,47 @@ def run_pipeline(
             )
 
     # ── Granger Causality ──────────────────────────────────────────────────────
+    # Wrapped defensively: statsmodels' grangercausalitytests can raise
+    # MemoryError on very large samples at high lag orders (observed on a
+    # ~27,000-row main-phase series with max_lag_steps=100). A failure here
+    # must NOT abort the whole pipeline and lose the TE/CCF work already
+    # computed and checkpointed above -- it falls back to a capped random
+    # subsample of the main-phase data, and if that still fails, logs the
+    # failure and continues with gc_results left empty for that pair.
     log.info("\nGranger causality tests …")
     gc_results: dict = {}
+    GRANGER_MAX_N = 15000  # Granger doesn't need the full main-phase pool for
+                           # a stable F-test; this keeps the OLS design matrix
+                           # a manageable size regardless of dataset length.
     for drv, rsp in [("Bz", "SYMH"), ("Ey", "AE")]:
-        x, y    = _align_pair(df[phases == "main"], drv, rsp)
-        gc_res  = granger_causality_test(x, y, max_lag_steps=gc_max_lag_steps)
+        x, y = _align_pair(df[phases == "main"], drv, rsp)
+        try:
+            gc_res = granger_causality_test(x, y, max_lag_steps=gc_max_lag_steps)
+        except MemoryError:
+            log.warning(
+                "Granger %s→%s: MemoryError at n=%d -- retrying on a random "
+                "subsample of %d points.", drv, rsp, len(x), GRANGER_MAX_N,
+            )
+            gc.collect()
+            try:
+                rng = np.random.default_rng(0)
+                if len(x) > GRANGER_MAX_N:
+                    idx = np.sort(rng.choice(len(x), GRANGER_MAX_N, replace=False))
+                    x, y = x[idx], y[idx]
+                gc_res = granger_causality_test(x, y, max_lag_steps=gc_max_lag_steps)
+            except Exception as e2:
+                log.error(
+                    "Granger %s→%s: failed even on subsample (%s). Skipping "
+                    "this pair; all other results are unaffected.",
+                    drv, rsp, e2,
+                )
+                continue
+        except Exception as e:
+            log.error(
+                "Granger %s→%s: unexpected error (%s). Skipping this pair; "
+                "all other results are unaffected.", drv, rsp, e,
+            )
+            continue
         gc_results[(drv, rsp)] = gc_res
         log.info(
             "  %s→%s  min-p lag = %d min   p = %.4e   sig lags: %s",
@@ -2228,56 +2853,99 @@ def run_pipeline(
             gc_res["min_p"],
             gc_res["significant"],
         )
+    gc.collect()
+
+    # ── Conditional Granger Causality ───────────────────────────────────────────
+    # Tests whether Bz carries predictive information about SYM-H beyond Ey
+    # (and SYM-H's own history) -- this was described in the manuscript
+    # Methods but had no corresponding implementation/call until now.
+    cgc_res = None
+    try:
+        log.info("\nConditional Granger causality (Bz -> SYM-H | Ey) …")
+        main_df_cgc = df[phases == "main"]
+        cgc_lag_order = max(1, int(round(30.0 / dt_min)))  # 30-minute lag order
+        cgc_res = conditional_granger_causality_test(
+            main_df_cgc["SYMH"].values, main_df_cgc["Ey"].values,
+            main_df_cgc["Bz"].values, lag_order=cgc_lag_order,
+        )
+        log.info(
+            "  CGC: Bz -> SYM-H | Ey   F(%d, %d) = %.3f   p = %.3e   "
+            "(lag order = %d steps = %d min, n_effective = %d)",
+            cgc_res["df1"], cgc_res["df2"], cgc_res["F_statistic"],
+            cgc_res["p_value"], cgc_res["lag_order"],
+            cgc_res["lag_order"] * dt_min, cgc_res["n_effective"],
+        )
+    except Exception as e:
+        log.error("Conditional Granger causality failed (%s); continuing without it.", e)
+    if cgc_res is not None:
+        pd.DataFrame([cgc_res]).to_csv(os.path.join(out, "cgc_result.csv"), index=False)
 
     # ── Partial Cross-Correlation ──────────────────────────────────────────────
-    log.info("\nPartial cross-correlations (main phase) …")
-    main_clean = df[phases == "main"].dropna(subset=["Bz", "Ey", "SYMH", "AE"])
-    pcc_bz = partial_cross_correlation(
-        main_clean["Bz"].values, main_clean["Ey"].values, main_clean["SYMH"].values,
-        max_lag_steps=ccf_max_lag_steps, dt_min=dt_min, ar_order=partial_ccf_ar_order,
-    )
-    pcc_ey = partial_cross_correlation(
-        main_clean["Ey"].values, main_clean["Bz"].values, main_clean["SYMH"].values,
-        max_lag_steps=ccf_max_lag_steps, dt_min=dt_min, ar_order=partial_ccf_ar_order,
-    )
-    log.info("  Bz→SYM-H (partial):  lag = %d min  r = %.3f",
-             pcc_bz["peak_lag_min"], pcc_bz["peak_r"])
-    log.info("  Ey→SYM-H (partial):  lag = %d min  r = %.3f",
-             pcc_ey["peak_lag_min"], pcc_ey["peak_r"])
-    if pcc_bz["peak_lag_min"] == 0:
-        log.warning(
-            "Partial CCF Bz→SYM-H: zero lag — possible residual multicollinearity. "
-            "Interpret cautiously."
+    # Each remaining section is wrapped defensively: these are all much
+    # cheaper than TE/Granger, but a failure in any one of them should still
+    # not prevent the others (or the figures at the end) from being produced
+    # and saved, given how much upstream work the pipeline represents.
+    pcc_bz = pcc_ey = None
+    try:
+        log.info("\nPartial cross-correlations (main phase) …")
+        main_clean = df[phases == "main"].dropna(subset=["Bz", "Ey", "SYMH", "AE"])
+        pcc_bz = partial_cross_correlation(
+            main_clean["Bz"].values, main_clean["Ey"].values, main_clean["SYMH"].values,
+            max_lag_steps=ccf_max_lag_steps, dt_min=dt_min, ar_order=partial_ccf_ar_order,
         )
+        pcc_ey = partial_cross_correlation(
+            main_clean["Ey"].values, main_clean["Bz"].values, main_clean["SYMH"].values,
+            max_lag_steps=ccf_max_lag_steps, dt_min=dt_min, ar_order=partial_ccf_ar_order,
+        )
+        log.info("  Bz→SYM-H (partial):  lag = %d min  r = %.3f",
+                 pcc_bz["peak_lag_min"], pcc_bz["peak_r"])
+        log.info("  Ey→SYM-H (partial):  lag = %d min  r = %.3f",
+                 pcc_ey["peak_lag_min"], pcc_ey["peak_r"])
+        if pcc_bz["peak_lag_min"] == 0:
+            log.warning(
+                "Partial CCF Bz→SYM-H: zero lag — possible residual multicollinearity. "
+                "Interpret cautiously."
+            )
+    except Exception as e:
+        log.error("Partial cross-correlation failed (%s); continuing without it.", e)
 
     # ── Storm-by-storm variability ─────────────────────────────────────────────
-    log.info("\nStorm-by-storm TE and CCF variability …")
-    te_var_bz = storm_by_storm_te(
-        df, storms, source_col="Bz", target_col="SYMH", phase="main",
-        max_lag_steps=te_max_lag_steps, k=te_k,
-        n_surrogates=max(50, te_n_surrogates // 4),
-        dt_min=dt_min, min_n=storm_te_min_n, n_max=te_n_max,
-    )
-    ccf_var_bz = storm_by_storm_ccf(
-        df, storms, source_col="Bz", target_col="SYMH",
-        phase="main", max_lag_steps=storm_ccf_max_lag_steps, dt_min=dt_min,
-        min_n=storm_ccf_min_n,
-    )
-    te_var_bz.to_csv(os.path.join(out, "storm_by_storm_te_bz_symh.csv"), index=False)
-    ccf_var_bz.to_csv(os.path.join(out, "storm_by_storm_ccf_bz_symh.csv"), index=False)
+    te_var_bz = pd.DataFrame()
+    ccf_var_bz = pd.DataFrame()
+    try:
+        log.info("\nStorm-by-storm TE and CCF variability …")
+        te_var_bz = storm_by_storm_te(
+            df, storms, source_col="Bz", target_col="SYMH", phase="main",
+            max_lag_steps=te_max_lag_steps, k=te_k,
+            n_surrogates=max(50, te_n_surrogates // 4),
+            dt_min=dt_min, min_n=storm_te_min_n, n_max=te_n_max,
+        )
+        ccf_var_bz = storm_by_storm_ccf(
+            df, storms, source_col="Bz", target_col="SYMH",
+            phase="main", max_lag_steps=storm_ccf_max_lag_steps, dt_min=dt_min,
+            min_n=storm_ccf_min_n,
+        )
+        te_var_bz.to_csv(os.path.join(out, "storm_by_storm_te_bz_symh.csv"), index=False)
+        ccf_var_bz.to_csv(os.path.join(out, "storm_by_storm_ccf_bz_symh.csv"), index=False)
+    except Exception as e:
+        log.error("Storm-by-storm variability failed (%s); continuing without it.", e)
 
     # ── Wavelet Coherence ──────────────────────────────────────────────────────
-    log.info("\nWavelet coherence (Bz–SYM-H, main phase) …")
-    wc_sub = df[phases == "main"].dropna(subset=["Bz", "SYMH"])
-    # NOTE: 2,000 is a fixed *sample count* per the Methodology (Sec. 2.8:
-    # "first 2,000 contiguous main-phase data points"), not a time duration,
-    # so it is intentionally left unscaled by cadence.
-    n_wc   = min(2000, len(wc_sub))
-    wc_res = wavelet_coherence(
-        wc_sub["Bz"].values[:n_wc],
-        wc_sub["SYMH"].values[:n_wc],
-        dt=dt_min, min_period_min=30, max_period_min=360,
-    )
+    wc_res = None
+    try:
+        log.info("\nWavelet coherence (Bz–SYM-H, main phase) …")
+        wc_sub = df[phases == "main"].dropna(subset=["Bz", "SYMH"])
+        # NOTE: 2,000 is a fixed *sample count* per the Methodology (Sec. 2.8:
+        # "first 2,000 contiguous main-phase data points"), not a time duration,
+        # so it is intentionally left unscaled by cadence.
+        n_wc   = min(2000, len(wc_sub))
+        wc_res = wavelet_coherence(
+            wc_sub["Bz"].values[:n_wc],
+            wc_sub["SYMH"].values[:n_wc],
+            dt=dt_min, min_period_min=30, max_period_min=360,
+        )
+    except Exception as e:
+        log.error("Wavelet coherence failed (%s); continuing without it.", e)
 
     # ── Decoupling Index ───────────────────────────────────────────────────────
     log.info("\nDecoupling indices per phase …")
@@ -2298,37 +2966,54 @@ def run_pipeline(
                      phase, drv, di["delta_lag_min"], di["delta_r"], di["D_index"])
 
     # ── Plots ──────────────────────────────────────────────────────────────────
+    # Built incrementally with one try/except PER figure: a missing or failed
+    # upstream result (e.g. Granger/wavelet failing for one pair) must only
+    # skip that one figure, not abort every figure the pipeline would
+    # otherwise still be able to produce and save.
     log.info("\nGenerating figures …")
-    figs: dict[str, plt.Figure] = {
-        "overview":   plot_overview(df, phases, storms),
-        "sea":        plot_sea(sea, ["Bz", "Ey", "SYMH", "AE"]),
-        "lag_chart":  plot_lag_results(lag_df),
-        "te_bz_symh": plot_te_scan(te_results[("Bz", "SYMH")],
-                                   "Transfer Entropy: Bz → SYM-H (main phase)"),
-        "te_ey_ae":   plot_te_scan(te_results[("Ey", "AE")],
-                                   "Transfer Entropy: Ey → AE (main phase)"),
-        "gc_bz_symh": plot_granger(gc_results[("Bz", "SYMH")],
-                                   "Granger Causality: Bz → SYM-H (main phase)"),
-        "wc_bz_symh": plot_wavelet_coherence(
-                          wc_res, wc_sub.index[:n_wc],
-                          "Wavelet Coherence: Bz ↔ SYM-H (main phase)"),
-        "wc_bands":   plot_wavelet_band_coherence(
-                          wc_res, wc_sub.index[:n_wc],
-                          "Band-averaged Coherence: Bz ↔ SYM-H (main phase)"),
-    }
+    figs: dict[str, plt.Figure] = {}
+
+    def _try_fig(name: str, builder):
+        try:
+            figs[name] = builder()
+        except Exception as e:
+            log.error("Figure '%s' failed (%s); skipping.", name, e)
+
+    _try_fig("overview",   lambda: plot_overview(df, phases, storms))
+    _try_fig("sea",        lambda: plot_sea(sea, ["Bz", "Ey", "SYMH", "AE"]))
+    _try_fig("lag_chart",  lambda: plot_lag_results(lag_df))
+    if ("Bz", "SYMH") in te_results:
+        _try_fig("te_bz_symh", lambda: plot_te_scan(
+            te_results[("Bz", "SYMH")], "Transfer Entropy: Bz → SYM-H (main phase)"))
+    if ("Ey", "AE") in te_results:
+        _try_fig("te_ey_ae", lambda: plot_te_scan(
+            te_results[("Ey", "AE")], "Transfer Entropy: Ey → AE (main phase)"))
+    if ("Bz", "SYMH") in gc_results:
+        _try_fig("gc_bz_symh", lambda: plot_granger(
+            gc_results[("Bz", "SYMH")], "Granger Causality: Bz → SYM-H (main phase)"))
+    if wc_res is not None:
+        _try_fig("wc_bz_symh", lambda: plot_wavelet_coherence(
+            wc_res, wc_sub.index[:n_wc], "Wavelet Coherence: Bz ↔ SYM-H (main phase)"))
+        _try_fig("wc_bands", lambda: plot_wavelet_band_coherence(
+            wc_res, wc_sub.index[:n_wc], "Band-averaged Coherence: Bz ↔ SYM-H (main phase)"))
     if not te_var_bz.empty or not ccf_var_bz.empty:
-        figs["storm_variability_bz"] = plot_storm_variability(
-            te_var_bz, ccf_var_bz, source_col="Bz", target_col="SYMH"
-        )
-    decouple_figs = plot_decoupling_summary(lag_df)
-    for drv, fig in decouple_figs.items():
-        figs[f"decoupling_{drv.lower()}"] = fig
+        _try_fig("storm_variability_bz", lambda: plot_storm_variability(
+            te_var_bz, ccf_var_bz, source_col="Bz", target_col="SYMH"))
+    try:
+        decouple_figs = plot_decoupling_summary(lag_df)
+        for drv, fig in decouple_figs.items():
+            figs[f"decoupling_{drv.lower()}"] = fig
+    except Exception as e:
+        log.error("Decoupling summary figures failed (%s); skipping.", e)
 
     for name, fig in figs.items():
-        path = os.path.join(out, f"fig_{name}.png")
-        fig.savefig(path, bbox_inches="tight", dpi=300)
-        plt.close(fig)
-        log.info("  Saved: %s", path)
+        try:
+            path = os.path.join(out, f"fig_{name}.png")
+            fig.savefig(path, bbox_inches="tight", dpi=300)
+            plt.close(fig)
+            log.info("  Saved: %s", path)
+        except Exception as e:
+            log.error("Saving figure '%s' failed (%s); skipping.", name, e)
 
     # ── Summary CSVs ──────────────────────────────────────────────────────────
     lag_df.to_csv(os.path.join(out, "phase_lag_table.csv"), index=False)
@@ -2358,6 +3043,8 @@ def run_pipeline(
         "storms_categorized":   storms_categorized,
         "magnitude_stats":      magnitude_stats,
         "driver_df":            driver_df,
+        "driver_type_df":       driver_type_df,
+        "ccf_by_driver_type":   ccf_by_driver,
         "sea_by_cat":           sea_by_cat,
         "interp_sensitivity":   interp_sensitivity,
         "sea":                  sea,
@@ -2367,6 +3054,7 @@ def run_pipeline(
         "te_var_bz":            te_var_bz,
         "ccf_var_bz":           ccf_var_bz,
         "wc_res":               wc_res,
+        "cgc_res":              cgc_res,
     }
 
 
@@ -2388,6 +3076,5 @@ if __name__ == "__main__":
         te_n_surrogates  = 200,    # use 200–500 for final publication
         te_k             = 5,
         te_max_lag_steps = None,   # auto-derived from TE_MAX_LAG_MIN (240 min)
-        te_n_max         = 25000,   # SPEED FIX: ~10-15 min vs ~6 h; consider raising
-                                   # for 1-min data since each phase now has ~5x rows
+        te_n_max         = 30000,   
     )
